@@ -1,0 +1,989 @@
+---
+title:  "Lab 2: Description Using Models"
+format: pdf
+subtitle: "Describing the relationship between sleep and mental health." 
+date: today
+date-format: long 
+author: 
+ - name: Geon Kim
+ - name: Chris Rezny
+ - name: Jordan Andersen
+output:
+  pdf_document:
+    latex_engine: xelatex
+    citation-package: biblatex
+bibliography: references.bib
+header-includes:
+  - \usepackage{fontspec}
+  - \usepackage{caption}
+  - \setmainfont{Roboto}
+  - \setsansfont{Roboto}
+  - \setmonofont{Roboto} # Change this to any installed font
+  - \captionsetup[figure]{font=scriptsize}
+  - \renewcommand{\normalsize}{\fontsize{9}{10}\selectfont}
+  - \renewcommand{\arraystretch}{0.9}
+---
+
+```{r environment setup, echo=FALSE}
+########################################################
+### Run once to synchronize environment and packages ###
+########################################################
+
+# renv::restore()
+knitr::opts_knit$set(root.dir = here::here())
+
+#########################################################################
+### Run this code before knitting to pdf to suppress warning messages ###
+#########################################################################
+
+ knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+```
+
+```{r install additional pacakges, echo=FALSE}
+#################################################
+### If necessary, install additional packages ###
+#################################################
+
+# renv::install(c("car", "here", "lmtest"))
+
+library(patchwork)
+library(tidyverse)
+library(car)
+
+library(modelsummary)
+library(flextable)
+knit_print.flextable <- function(x, ...) {
+  knitr::asis_output(as.character(as_raster(x, zoom = 2)), meta = list(format = "markdown"))
+}
+library(dplyr)
+library(broom)
+library(officer)
+library(sysfonts)
+library(paletteer)
+library(ggrastr)
+
+# Add Google font (e.g., Roboto)
+font_add_google("Roboto", "roboto")
+showtext::showtext_auto()
+```
+
+```{r summary_table_function}
+#| message: false
+#| warning: false
+#| include: false
+#| paged-print: false
+summarize_model_clean <- function(model, dep_var = "Dependent Variable") {
+  library(broom)
+  library(dplyr)
+  library(stringr)
+  library(tibble)
+  library(knitr)
+  library(kableExtra)
+
+  tidy_df <- broom::tidy(model)
+  all_vars <- all.vars(formula(model)[[3]])
+
+  tidy_df <- tidy_df %>%
+    rowwise() %>%
+    mutate(
+      Variable = case_when(
+        term == "(Intercept)" ~ "Intercept",
+        TRUE ~ {
+          matched_var <- all_vars[str_detect(term, paste0("^", all_vars))]
+          if (length(matched_var) > 0) matched_var[1] else term
+        }
+      )
+    ) %>%
+    ungroup() %>%
+    mutate(
+      Category = case_when(
+        term == "(Intercept)" ~ "—",
+        Variable == term ~ "—",
+        TRUE ~ str_remove(term, paste0("^", Variable))
+      ),
+      Category = str_replace(Category, "^[:_]*", ""),
+      Stars = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01 ~ "**",
+        p.value < 0.05 ~ "*",
+        p.value < 0.1 ~ "+",
+        TRUE ~ ""
+      ),
+      `Estimate (SE, Stars)` = paste0(round(estimate, 3), Stars, " (", round(std.error, 3), ")")
+    ) %>%
+    arrange(factor(Variable, levels = unique(c("Intercept", all_vars)))) %>%
+    group_by(Variable) %>%
+    mutate(Variable = ifelse(row_number() == 1, Variable, "")) %>%
+    ungroup() %>%
+    select(term, Variable, Category, `Estimate (SE, Stars)`)
+
+  model_info <- tibble(
+  term = c("Num.Obs.", "Residual Std. Error", "R²", "R² Adj.", "F"),
+  Variable = rep("", 5),
+  Category = term,
+  `Estimate (SE, Stars)` = as.character(c(
+    nobs(model),
+    round(summary(model)$sigma, 3),
+    round(summary(model)$r.squared, 3),
+    round(summary(model)$adj.r.squared, 3),
+    round(summary(model)$fstatistic[1], 3)
+  ))
+)
+
+  summary_table <- bind_rows(tidy_df, model_info)
+  
+  target_rows <- summary_table %>%
+  mutate(
+    is_block_start = (Variable == "" & lead(Variable, default = "") != "") | Category == '—' | lead(Category, default = "") == 'Num.Obs.'
+  ) %>%
+  pull(is_block_start) %>%
+  which()
+
+  f_row <- which(summary_table$term == "F")
+  num_obs_row <- which(summary_table$term == "Num.Obs.") - 1
+
+  summary_table %>%
+    select(-term) %>%
+    rename(
+      `Subgroup` = Category,
+      `Estimate (SE, Stars)` = `Estimate (SE, Stars)`
+    ) %>%
+    kbl(booktabs = TRUE, caption = dep_var) %>%
+    kable_styling(latex_options = c("hold_position", "scale_down"), full_width = TRUE, font_size = 8) %>%
+    row_spec(num_obs_row, hline_after = TRUE) %>%
+    row_spec(f_row, hline_after = TRUE) %>%
+    row_spec(which(summary_table$Variable == "Intercept"), hline_after = TRUE) %>%
+    row_spec(target_rows, hline_after = TRUE) %>%
+    column_spec(1, bold = TRUE) %>%
+    footnote(general = "+ p < 0.1, * p < 0.05, ** p < 0.01, *** p < 0.001", general_title = "")
+}
+
+
+summarize_vif_table <- function(model, title = "Variance Inflation Factors") {
+  library(car)
+  library(dplyr)
+  library(tibble)
+  library(knitr)
+  library(kableExtra)
+
+  vif_values <- car::vif(model)
+
+  if (is.matrix(vif_values)) {
+    vif_df <- as.data.frame(vif_values) %>%
+      rownames_to_column(var = "Variable") %>%
+      rename(
+        `GVIF` = GVIF,
+        `Df` = Df,
+        `GVIF Adjusted (GVIF¹ᐟ²ᴰᶠ)` = `GVIF^(1/(2*Df))`
+      ) %>%
+      mutate(across(where(is.numeric), round, 3))
+  } else {
+    vif_df <- tibble(
+      Variable = names(vif_values),
+      GVIF = round(as.numeric(vif_values), 3),
+      Df = 1,
+      `GVIF Adjusted (GVIF¹ᐟ²ᴰᶠ)` = round(as.numeric(vif_values), 3)
+    )
+  }
+
+  vif_df %>%
+    kbl(booktabs = TRUE, caption = title) %>%
+    kable_styling(latex_options = c("hold_position", "scale_down"), full_width = TRUE, font_size = 8)
+}
+
+summarize_coeftest_table <- function(coef_test_obj, dep_var = "Dependent Variable") {
+  library(dplyr)
+  library(knitr)
+  library(kableExtra)
+  library(tibble)
+  
+  coef_df <- as.data.frame(coef_test_obj)
+  colnames(coef_df) <- c("Estimate", "Std. Error", "t value", "Pr(>|t|)")
+
+  summary_table <- coef_df %>%
+    rownames_to_column(var = "Predictor") %>%
+    mutate(
+      Category = "—",
+      Stars = case_when(
+        `Pr(>|t|)` < 0.001 ~ "***",
+        `Pr(>|t|)` < 0.01 ~ "**",
+        `Pr(>|t|)` < 0.05 ~ "*",
+        `Pr(>|t|)` < 0.1 ~ "+",
+        TRUE ~ ""
+      ),
+      `Estimate (SE, Stars)` = paste0(
+        round(Estimate, 3), Stars,
+        " (", round(`Std. Error`, 3), ")"
+      )
+    ) %>%
+    mutate(Predictor = ifelse(Predictor == "(Intercept)", "Intercept", Predictor)) %>%
+    select(Variable = Predictor, Category, `Estimate (SE, Stars)`)
+
+  summary_table %>%
+    kbl(booktabs = TRUE, caption = dep_var) %>%
+    kable_styling(latex_options = c("hold_position", "scale_down"), full_width = TRUE, font_size = 8) %>%
+    row_spec(which(summary_table$Predictor == "Intercept"), hline_after = TRUE) %>%
+    column_spec(1, bold = TRUE) %>%
+    footnote(general = "+ p < 0.1, * p < 0.05, ** p < 0.01, *** p < 0.001", general_title = "")
+}
+
+summarize_robust_model <- function(model, type = "HC1", dep_var = "Dependent Variable") {
+  
+  library(dplyr)
+  library(tibble)
+  library(knitr)
+  library(kableExtra)
+  library(stringr)
+  library(broom)
+  library(sandwich)  # for vcovHC()
+  library(lmtest)    # for coeftest()
+
+  coeftest_obj <- coeftest(model, vcov = vcovHC(model, type = type))
+
+  # Get original variable names from the model
+  all_vars <- all.vars(formula(model)[[3]])
+
+  # Convert coeftest matrix to data frame
+  robust_df <- as.data.frame(unclass(coeftest_obj))
+  colnames(robust_df) <- c("Estimate", "Std. Error", "t value", "Pr(>|t|)")
+  term_names <- rownames(robust_df)
+
+  summary_table <- robust_df %>%
+    rownames_to_column("term") %>%
+    rowwise() %>%
+    mutate(
+      Variable = case_when(
+        term == "(Intercept)" ~ "Intercept",
+        TRUE ~ {
+          matched_var <- all_vars[str_detect(term, paste0("^", all_vars))]
+          if (length(matched_var) > 0) matched_var[1] else term
+        }
+      ),
+      Category = case_when(
+        term == "(Intercept)" ~ "—",
+        Variable == term ~ "—",
+        TRUE ~ str_remove(term, paste0("^", Variable))
+      ),
+      Category = str_replace(Category, "^[:_\\s]*", ""),
+      Stars = case_when(
+        `Pr(>|t|)` < 0.001 ~ "***",
+        `Pr(>|t|)` < 0.01 ~ "**",
+        `Pr(>|t|)` < 0.05 ~ "*",
+        `Pr(>|t|)` < 0.1 ~ "+",
+        TRUE ~ ""
+      ),
+      `p-value` = paste0(formatC(`Pr(>|t|)`, format = "f", digits = 3), " ", Stars)
+    ) %>%
+    ungroup() %>%
+    arrange(factor(Variable, levels = unique(c("Intercept", all_vars)))) %>%
+    group_by(Variable) %>%
+    mutate(Variable = ifelse(row_number() == 1, Variable, "")) %>%
+    ungroup()
+
+  # Horizontal lines after intercept and block starts
+  intercept_row <- which(summary_table$term == "(Intercept)")
+  target_rows <- summary_table %>%
+    mutate(is_block_start = (Variable == "" & lead(Variable, default = "") != "") | Category == '—' ) %>%
+    pull(is_block_start) %>%
+    which()
+
+  # Format table
+  summary_table %>%
+    select(
+      Variable,
+      Subgroup = Category,
+      Estimate,
+      `Std. Error`,
+      `t value`,
+      `p-value`
+    ) %>%
+    kbl(booktabs = TRUE, caption = dep_var, align = "llrrrl", digits = 3) %>%
+    kable_styling(
+      latex_options = c("hold_position", "scale_down"),
+      full_width = TRUE,
+      font_size = 8
+    ) %>%
+    column_spec(1, bold = TRUE) %>%
+    row_spec(intercept_row, hline_after = TRUE) %>%
+    row_spec(target_rows, hline_after = TRUE) %>%
+    footnote(
+      general = "+ p < 0.1, * p < 0.05, ** p < 0.01, *** p < 0.001",
+      general_title = ""
+    )
+}
+
+
+```
+
+```{r load data, echo=FALSE}
+############################################
+### Load filtered and cleaned BRFSS data ###
+############################################
+
+load(here::here("data", "raw", "LLCP2022_FILTERED.RData"))
+data <- filtered_data
+
+```
+
+```{r set_plotting_theme, echo=FALSE}
+##########################
+### Set plotting theme ###
+##########################
+
+theme_set(
+  theme_minimal(base_family = "roboto") +
+    theme(
+      text = element_text(family = "roboto"),
+      legend.title = element_text(
+        family = "roboto",
+        size = 6),
+      legend.text = element_text(
+        family = "roboto",
+        size = 6),
+      axis.title = element_text(
+        family = "roboto",
+        size = 6),
+      axis.text = element_text(
+        family = "roboto",
+        size = 6
+        ),
+      plot.title = element_text(
+        family = "roboto",
+        hjust = 0.5,    # Center the title
+        size = 9       # Smaller font (default is usually ~14)
+        )
+    
+    )
+)
+annotation_theme <- theme(
+  plot.title = element_text(
+    family = "roboto", 
+    size = 9,        # match your plot.title size
+    hjust = 0.5
+  ),
+  axis.title = element_text(
+    family = "roboto",
+    size = 6
+  ),
+  axis.text = element_text(
+    family = "roboto",
+    size = 6
+  ),
+  legend.title = element_text(
+    family = "roboto",
+    size = 6
+  ),
+  legend.text = element_text(
+    family = "roboto",
+    size = 5
+  ),
+  plot.tag = element_text(
+    family = "roboto",
+    size = 6
+  ),
+  legend.spacing = unit(1, "mm"),
+  legend.key.size = unit(0.1, "cm"),
+  legend.key.height = unit(0.5, "mm")
+)
+theme_update(plot.tag = element_text(family = "roboto", size = 6, face = "bold"))
+
+```
+
+## Introduction
+
+This study investigates how sleep duration is influenced by mental health, general health, physical health, and age. While prior research often examines how sleep impacts health, we reverse the focus to explore how these external factors affect sleep itself. Previous studies have found links between mental health and sleep in college populations [@milojevich2016sleep], as well as differences in sleep by age and gender [@luca2015sleep]. Understanding these dynamics can inform personal and public health strategies.
+
+We use data from the 2022 Behavioral Risk Factor Surveillance System (BRFSS) [@cdc2022brfss], which surveys non-institutionalized adults (18+) across all U.S. states and territories via landline and mobile interviews. The sampling design selects one adult per household and includes random mobile respondents to enhance representation. Focusing on self-reported days of poor mental, general and physical health, along with age, we evaluate how these variables relate to sleep. Our aim is to quantify how much these factors contribute to variations in sleep duration across a diverse population.
+
+## Operationalization and Wrangling
+
+The BRFSS dataset includes a wide range of health topics, many unrelated to our focus. To align with our research question, we retained only variables related to sleep, mental health, physical activity, general health and age. Among the many available indicators, we selected general measures such as the number of days in the past month a respondent experienced poor mental or general health. This allows us to broadly assess the relationship between health and sleep while leaving room for future analysis of more detailed factors.We also recoded some numeric variables into string labels to improve clarity, making the data more human-readable and flexible for analysis.
+
+To support model development and reduce researcher degrees of freedom, we split our dataset into two parts: a 30% experimental set and a 70% confirmation set. The experimental set was used for exploration and modeling; the confirmation set validated findings. The experimental set contained a sample of 12,686 observations from the original 400,000+. We created plots to confirm that the experimental sample maintained the distributional properties of the full dataset, preserving approximate random sampling and i.i.d. conditions (Appendix A).
+
+```{r operationalization, echo=FALSE}
+#############################################
+### Convert numeric indicators to strings ###
+#############################################
+
+data <- data %>%
+  mutate(
+    SEXVAR = factor(SEXVAR, levels = c(1, 2), labels = c("Male", "Female")),
+    
+    GENHLTH = factor(GENHLTH, levels = 1:5,
+                     labels = c("Excellent", "Very good", "Good", "Fair", "Poor")),
+    
+    
+    PHYSHLTH =
+      case_when(
+        PHYSHLTH == 88 ~ 0,
+      PHYSHLTH %in% c(77, 99) ~ NA_real_, 
+      TRUE ~ as.numeric(PHYSHLTH)),
+    
+    
+    MENTHLTH =
+      case_when(
+        MENTHLTH == 88 ~ 0,
+      MENTHLTH %in% c(77, 99) ~ NA_real_, 
+      TRUE ~ as.numeric(MENTHLTH)),
+    
+    EXERANY2 = factor(EXERANY2, levels = c(1, 2, 7, 9),
+                      labels = c("Yes", "No", "Don't know", "Refused")),
+    
+    CVDINFR4 = factor(CVDINFR4, levels = c(1, 2, 7, 9),
+                      labels = c("Yes", "No", "Don't know", "Refused")),
+    
+    CVDCRHD4 = factor(CVDCRHD4, levels = c(1, 2, 7, 9),
+                      labels = c("Yes", "No", "Don't know", "Refused")),
+    
+    ADDEPEV3 = factor(ADDEPEV3, levels = c(1, 2, 7, 9),
+                      labels = c("Yes", "No", "Don't know", "Refused")),
+    
+    
+    
+    SLEPTIM1 = ifelse(SLEPTIM1 %in% c(77, 99), NA, SLEPTIM1),
+    
+    CHILDREN =
+      case_when(
+        CHILDREN == 88 ~ 0,
+      CHILDREN %in% c(77, 99) ~ NA_real_, 
+      TRUE ~ as.numeric(CHILDREN)),
+    
+
+    LCSNUMCG = case_when(
+      LCSNUMCG == 0 ~ 0,
+      LCSNUMCG %in% c(777, 999) ~ NA_real_,
+      TRUE ~ as.numeric(LCSNUMCG)
+    ),
+    
+    AVEDRNK3 = case_when(
+      AVEDRNK3 == 88 ~ 0,
+      AVEDRNK3 %in% c(77, 99) ~ NA_real_,
+      TRUE ~ as.numeric(AVEDRNK3)
+    ),
+    
+    WORKCFS = factor(WORKCFS, levels = c(1, 2, 7, 9),
+                     labels = c("Yes", "No", "Don't know", "Refused")),
+    
+    AGEG5YR = factor(`_AGEG5YR`, levels = 1:13,
+                        labels = c("18–24", "25–29", "30–34", "35–39", "40–44", "45–49",
+                                   "50–54", "55–59", "60–64", "65–69", "70–74", "75–79", "80+")),
+    
+    EMPLOY1 = factor(EMPLOY1, levels = 1:9,
+                     labels = c("Employed for wages", "Self-employed", "Out of work ≥1 year",
+                                "Out of work <1 year", "Homemaker", "Student",
+                                "Retired", "Unable to work", "Refused")),
+    
+    MARITAL = factor(MARITAL, levels = c(1:6, 9),
+                     labels = c("Married", "Divorced", "Widowed", "Separated",
+                                "Never married", "Unmarried couple", "Refused")),
+    
+    EDUCA = factor(EDUCA, levels = 1:6,
+                   labels = c("Never attended/Kindergarten", "Grades 1–8", "Grades 9–11",
+                              "High school graduate", "Some college/technical school",
+                              "College graduate"))
+  )
+data$rand_id <- sample(1:nrow(data), nrow(data), replace = FALSE)
+
+```
+
+```{r experimental and confirmation sets, echo=FALSE}
+#######################################
+### Create mental health categories ###
+#######################################
+
+data <- data %>%
+  mutate(MENTHLTH_CAT = case_when(
+    MENTHLTH == 0 ~ "None",
+    MENTHLTH >= 1 & MENTHLTH <= 10 ~ "1–10",
+    MENTHLTH >= 11 & MENTHLTH <= 20 ~ "11–20",
+    MENTHLTH > 20 ~ ">20"
+  ))
+
+
+data$MENTHLTH_CAT <- factor(
+  data$MENTHLTH_CAT,
+  levels = c("None", "1–10", "11–20", ">20")  # "None" is now reference
+)
+
+data <- data %>%
+  filter(!is.na(MENTHLTH),  !is.na(SLEPTIM1), SLEPTIM1 > 0, SLEPTIM1 < 20, !is.na(AGEG5YR)) 
+
+
+total_rows <- data %>%
+      nrow()
+
+#############################
+### Create age categories ###
+#############################
+
+data <- data %>%
+  mutate(
+    AGE_CAT = case_when(
+      as.character(AGEG5YR) == "18–24" ~ "18-24",
+      as.character(AGEG5YR) == "25–29" ~ "25-29",
+      as.character(AGEG5YR) %in% c("30–34", "35–39", "40–44", "45–49") ~ "30-49",
+      as.character(AGEG5YR) %in% c("50–54", "55–59", "60–64", "65–69") ~ "50-69",
+      as.character(AGEG5YR) %in% c("70–74", "75–79", "80+") ~ ">70",
+      TRUE ~ NA_character_
+    )
+  )
+
+data$AGE_CAT <- factor(
+  data$AGE_CAT,
+  levels = c("18-24", "25-29", "30-49", "50-69", ">70")
+)
+
+
+
+#######################################################
+### Generate experimental and confirmation datasets ###
+#######################################################
+
+exp_indices <- sample(seq_len(total_rows), size = round(0.3 * total_rows))
+
+
+conf_set <- data[exp_indices, ]
+exp_set <- data[-exp_indices, ]
+
+```
+
+## Model Specification
+
+### 1st model
+
+Our base model distributes the number of hours slept (SLEPTIM1) on number of days reported of poor mental health (MENTHLTH_CAT). The results of this model show that the mental health category does have a statistically significant effect on hours slept, but it only explains a small portion of why people sleep more or less, with the adjusted R-Squared resulting in a low 0.018.
+
+```{r first_model, echo=FALSE}
+#######################################################
+### Base model SLEPTIM1 distributed on MENTHLTH_CAT ###
+#######################################################
+model1 <- lm(SLEPTIM1 ~ MENTHLTH_CAT, data = exp_set)
+summarize_model_clean(model1)
+```
+
+The variance on prediction is about 1.45 hours. We can see in the plot below that those who reported no days of poor mental health in the past month slept on average 7.1 hours per night. On the other end of the spectrum, those who reported 20 or more days of poor mental health in the past month slept 6.5 hours per night on average, with a much wider spread of responses and with the median being closer to 6 hours. This shows that our model describes some parts of the variance of hours slept, but there is still a lot to investigate.
+
+```{r plot_sleep_hours_and_mental_health, echo=FALSE}
+#| fig-cap: While the distribution of the hours of reported sleep for the first 3 catagories is almost identical, we do see a change in the means.  Additionally, the expanded range of sleep hours of those with higher occurances of poor mental health aligns with the anaylsis of the above model.
+#| fig-height: 2
+#| fig-pos: H
+#| fig-align: center
+#| label: fig-dist
+#################################################
+### Box plot of SLEPTIM1 + MENTHLTH_CAT means ###
+#################################################
+
+
+summary_data <- exp_set %>%
+  group_by(MENTHLTH_CAT) %>%
+  summarize(
+    mean_sleep = mean(SLEPTIM1, na.rm = TRUE),
+    se_sleep = sd(SLEPTIM1, na.rm = TRUE) / sqrt(n())
+  )
+
+# Create summary data with a legend group
+means <- exp_set %>%
+  group_by(MENTHLTH_CAT) %>%
+  summarize(mean_sleep = mean(SLEPTIM1, na.rm = TRUE)) %>%
+  mutate(legend_group = "Mean Sleep")
+
+
+plott <- ggplot(exp_set, aes(x = MENTHLTH_CAT, y = SLEPTIM1)) +
+  geom_boxplot(aes(fill = MENTHLTH_CAT), alpha = 0.6, outlier.color = "gray", size = 0.15) +
+  geom_point(
+    data = means,
+    aes(x = MENTHLTH_CAT, y = mean_sleep, shape = legend_group),
+    size = 3,
+    fill = "white",     # inner color
+    color = "gray30",   # border
+    stroke = 0.5,
+    inherit.aes = FALSE
+  ) +
+  geom_text(data = means, aes(x = MENTHLTH_CAT, y = mean_sleep + 0.4, label = round(mean_sleep, 1)), size = 3) +
+  scale_fill_manual(
+  name = "Mental Health Category",
+  values = c(
+    "None"   = "#66c2a5",
+    "1–10"   = "#fc8d62",
+    "11–20"  = "#8da0cb",
+    ">20"    = "#e78ac3"
+  )
+) +
+  scale_shape_manual(
+    name = "",  # Label for the shape legend
+    values = c("Mean Sleep" = 21)  # 21 supports fill and border
+  ) +
+  guides(
+    fill = guide_legend(order = 1),
+    shape = guide_legend(order = 2)
+  ) +
+  coord_cartesian(ylim = c(4, 10)) +
+  labs(
+    x = "Days of Poor Mental Health per Month",
+    y = "Average Hours Slept per Night"
+  ) 
+
+(plott) +
+  plot_annotation(
+    title = "Range of Sleeping Hours by Mental Health Category",
+    theme = annotation_theme
+  )
+```
+
+### 2nd Model:
+
+We continued to explore the statistical and practical significance of including other variables in the model to determine how we can build a second model that more accurately describes the trends in the data. We seperated variables into demographic and health variables, and explored how those variables affect overall sleep time. Our most successful model from this exploration was sleep time distributed on mental health, physical health, general health and age.
+
+This model resulted in an adjusted R squared of 0.036, showing improvement from the original base model, however still leaving room for significant influence from other factors.
+
+```{r model2, echo=FALSE}
+####################################################################
+### Full descriptive model SLEPTIM1 distributed on MENTHLTH_CAT, ###
+### PHYSHLTH, GENHLTH, and AGEG5YR.                              ###
+####################################################################
+
+model2 <- lm(SLEPTIM1 ~ MENTHLTH_CAT + PHYSHLTH + GENHLTH + AGE_CAT, data = exp_set)
+summarize_model_clean(model2)
+
+```
+
+```{r genhlth_and_sleptim1_plot, echo=FALSE}
+#| fig-cap: (A) The distribution of sleep hours based on the reported health of participants shows a shift in the means as general health declines, although the overall distribution of sleep hours remains relatively stable. (B) The distribution of sleep hours per day according to the number of poor physical health days per month similarly indicates a decrease in the means as the number of poor physical health days increases.  
+#| fig-height: 2.5
+#| fig-align: center
+#| fig-pos: H
+#| label: model2_box_plot
+############################################
+### Box plot of SLEPTIM1 + GENHLTH means ###
+############################################
+
+GENHLTH_means <- exp_set %>%
+  filter(!is.na(GENHLTH)) %>%
+  group_by(GENHLTH) %>%
+  summarize(mean_sleep = mean(SLEPTIM1, na.rm = TRUE)) %>%
+  mutate(legend_group = "Mean Sleep")
+
+exp <- exp_set %>%
+  filter(!is.na(GENHLTH)) 
+
+general_health_plot <- ggplot(exp, aes(x = GENHLTH, y = SLEPTIM1)) +
+  geom_boxplot(aes(fill = GENHLTH), alpha = 0.6, outlier.color = "gray", size = 0.15) +
+
+  # ✅ DO NOT hardcode `shape = 21` — let scale_shape_manual control it
+  geom_point(
+    data = GENHLTH_means,
+    aes(x = GENHLTH, y = mean_sleep, shape = legend_group),
+    size = 2,
+    fill = "white",     # inner color
+    color = "gray30",   # border
+    stroke = 0.5,
+    inherit.aes = FALSE
+  ) +
+
+  geom_text(data = GENHLTH_means, aes(x = GENHLTH, y = mean_sleep + 0.4,
+                              label = round(mean_sleep, 1)), size = 2) +
+
+  scale_fill_manual(
+  name = "Reported General Health",
+  values = c(
+    "Excellent"   = "#dedede",
+    "Very good"   = "#66c2a5",
+    "Good"   = "#fc8d62",
+    "Fair"  = "#8da0cb",
+    "Poor"    = "#e78ac3"
+  )
+) +
+
+
+  scale_shape_manual(
+    name = "",  # Label for the shape legend
+    values = c("Mean Sleep" = 21)  # 21 supports fill and border
+  ) +
+
+  guides(
+    fill = guide_legend(order = 1),
+    shape = guide_legend(order = 2)
+  ) +
+
+  coord_cartesian(ylim = c(4, 10)) +
+  labs(
+    x = "General Health Category",
+    y = "Average Sleep Hours"
+  )
+
+exp <- exp_set %>%
+  filter(!is.na(PHYSHLTH))
+
+exp <- exp %>%
+  mutate(PHYSHLTH_CAT = case_when(
+    PHYSHLTH == 0 ~ "None",
+    PHYSHLTH >= 1 & PHYSHLTH <= 5 ~ "1–5",
+    PHYSHLTH >= 6 & PHYSHLTH <= 10 ~ "6–10",  # fixed range
+    PHYSHLTH >= 11 & PHYSHLTH <= 20 ~ "11–20",
+    PHYSHLTH > 20 ~ ">20"
+  ),
+  PHYSHLTH_CAT = factor(PHYSHLTH_CAT, levels = c("None", "1–5", "6–10", "11–20", ">20"))
+  )
+general_health_plot <- general_health_plot +
+  theme(axis.text.x = element_blank())
+
+
+PHYSHLTH_means <- exp %>%
+  filter(!is.na(PHYSHLTH_CAT)) %>%
+  group_by(PHYSHLTH_CAT) %>%
+  summarize(mean_sleep = mean(SLEPTIM1, na.rm = TRUE)) %>%
+  mutate(legend_group = "Mean Sleep")
+
+
+physical_health_plot <- ggplot(exp, aes(x = PHYSHLTH_CAT, y = SLEPTIM1)) +
+  geom_boxplot(aes(fill = PHYSHLTH_CAT), alpha = 0.6, outlier.color = "gray", size = 0.155) +
+
+  # ✅ DO NOT hardcode `shape = 21` — let scale_shape_manual control it
+  geom_point(
+    data = PHYSHLTH_means,
+    aes(x = PHYSHLTH_CAT, y = mean_sleep, shape = legend_group),
+    size = 2,
+    fill = "white",     # inner color
+    color = "gray30",   # border
+    stroke = 0.5,
+    inherit.aes = FALSE
+  ) +
+
+  geom_text(data = PHYSHLTH_means, aes(x = PHYSHLTH_CAT, y = mean_sleep + 0.4,
+                              label = round(mean_sleep, 1)), size = 2) +
+
+  scale_fill_manual(
+  name = "Days of Poor Physical Health",
+  values = c(
+    "None"   = "#dedede",
+    "1–5" = "#66c2a5",
+    "6–10" = "#fc8d62",
+    "11–20" = "#8da0cb",
+    ">20" = "#e78ac3"
+  )
+) +
+
+
+  scale_shape_manual(
+    name = "",  # Label for the shape legend
+    values = c("Mean Sleep" = 21)  # 21 supports fill and border
+  ) +
+
+  guides(
+    fill = guide_legend(order = 1),
+    shape = guide_legend(order = 2)
+  ) +
+
+  coord_cartesian(ylim = c(4, 10)) +
+  labs(
+    x = "Physical Health Category",
+    y = "Average Sleep Hours"
+  )
+physical_health_plot <- physical_health_plot +
+  theme(axis.text.x = element_blank())
+
+combined_plot <- general_health_plot + physical_health_plot +
+  plot_annotation(
+    title = "Sleep Hours for General and Physical Health Categories",
+    tag_levels = "A",
+    theme = annotation_theme
+  )
+
+combined_plot
+  
+  
+```
+
+## Model Assumptions
+
+**Assumption 1: Data are IID**
+
+The sampling approach attempts to reduce dependence by selecting one adult per household and including random cell phone respondents, however true independence is not guaranteed due to potential clustering within geographic regions and shared household or community environments. Although all participants are US adults, they are not sampled identically. The BRFSS uses a complex sampling design involving stratification and weighting to correct for unequal probabilities of selection, non-response, and to improve representation. Therefore raw data points are not identically distributed, though appropriate application of survey weights can produce approximately unbiased population-level estimates. So, while BRFSS data are not strictly IID, the survey methodology allows for valid inferences.
+
+**Assumption 2: Linear Conditional Expectation**
+
+To fulfill the Linear Conditional Expectation assumption, no independent variables can be an exact linear combination of the others. Otherwise stated, the plot of their residuals vs fitted values do not have a slope of 0. In our models, the effect size is very small, so the slope is near zero, but not exactly 0 (Appendix B).
+
+```{r model_data, echo=FALSE}
+
+model_data <- data.frame(
+residuals = resid(model2),
+fitted = fitted(model2),
+predictors = model2$model
+)
+
+```
+
+**Assumption 3: No Perfect Collinearity**
+
+We can assume that our models do not have Perfect Collinearity, since no variables were dropped when running a regression. This is illustrated in the summary tables above. One way to confirm that there is no perfect collinearity between coefficients is by applying the variance inflation factor vif() to our model. If we get very high values in return, for example vif \> 10, that could suggest that there is multicollinearity within our coefficients.
+
+The vif for the variables MENTHLTH_CAT, GENHLTH, PHYSHLTH and AGE_CAT  all fall between 1 and 1.6, representing a low factor (Appendix D). From this we can assume that there is no significant multicollinearity, and our matrix is likely not singular.
+
+**Assumption 4: Homoskedastic Conditional Variance**
+
+To assess whether the variance of the residuals is constant across levels of the predicted values, we plotted the residuals against the predicted sleep hours. As shown in Figure A of the Residuals vs Fitted Values section (Appendix B), the spread of residuals does not fan out or taper off drastically, suggesting that heteroskedasticity is not visually obvious. However, there are some faint curved patterns that could indicate mild heteroskedasticity.
+
+To confirm this assumption, we conducted a Breusch-Pagan test (Appendix E), which statistically tests whether the residual variance is dependent on the fitted values. A significant p-value (p \< 0.05) would indicate heteroskedasticity.The p-value result from the Breusch–Pagan test is less than 2.2e-16, which is far below the 0.05 threshold. This result provides strong evidence to reject the null hypothesis of constant variance. In other words, heteroskedasticity is likely present in our model’s residuals. While this does not invalidate our model, it suggests that inference based on standard errors should be interpreted with caution.
+
+Given the significant result from the Breusch–Pagan test and evidence of heteroskedasticity, we recalculated our model using heteroskedasticity-robust standard errors via the vcovHC() method with HC1 correction. The results confirmed our original findings, with slightly adjusted standard errors. Most key variables remained statistically significant, but this correction ensures more valid inference (Table 3).
+
+```{r robust standard errors, echo = FALSE}
+summarize_robust_model(model2, type = "HC1", dep_var = "Table: Robust Coefficients")
+```
+
+**Assumption 5: Normally Distributed Errors**
+
+A key assumption of the classical linear model is that residuals are normally distributed. While non-normal residuals do not bias regression coefficients, they may affect hypothesis testing accuracy. In large datasets like ours, the Central Limit Theorem tends to reduce this concern. To check for normality, we generated a Q-Q plot and performed a Shapiro–Wilk test on a random sample of 5,000 residuals.
+
+From the Q-Q plot (Appendix C), we see that the central portion of the residual distribution follows the 45-degree reference line fairly closely. However, the tails deviate from normality, particularly at both extremes, where residuals are more spread out than expected under a normal distribution. This "heavy-tailed" pattern is not uncommon in real-world data.
+
+```{r shapiro, echo = FALSE}
+shapiro_result <- shapiro.test(sample(resid(model2), 5000))  # sample for large n
+shapiro_result
+
+
+```
+
+Executing a Shapiro–Wilk test returned a W statistic of 0.94 and a p-value of \< 2.2e-16. This leads us to reject the null hypothesis of normally distributed residuals. Due to the very large sample size, even slight deviations from normality yield statistically significant results. The visual evidence suggests that residuals are not perfectly normal, but close enough in the center of the distribution to satisfy this assumption for regression inference given the size of our dataset.
+
+## Overall Effect
+
+Our findings suggest that sleep duration is modestly influenced by mental health, physical health, general health, and age. Individuals who reported more days of poor mental or physical health tended to sleep slightly less, and those with poor self-reported general health also showed lower average sleep hours. While these relationships were statistically significant, the effect sizes were small — for instance, people with over 20 days of poor mental health slept only about half an hour less per night on average than those with none. The expanded model, which included all health and age variables, more than doubled the explanatory power of our base model, yet still explained only about 3.7% of the variance in sleep. This highlights that while health and demographic factors are relevant, sleep is likely shaped by a wider range of behavioral, environmental, and psychological influences not captured in our analysis.
+
+That said, even modest effect sizes should be interpreted in context. For a variable to account for 30 minutes of sleep per night is meaningful when compared relative to the average sleep duration of 7 hours. Small changes may be very significant in real world applications.
+
+{{< pagebreak >}}
+
+## Appendix
+
+**Appendix A:** *Plots for distribution of key variables*
+
+```{r var_plot, echo=FALSE}
+#| fig-cap: Appendix A- The distribution of hours of sleep per day (SLEPTIM1) follows a normal distribution (A).  The distribution of the number of poor mental health days during the past 30 days does not follow a normal distribution (B). This suggested that creating descrete variables would necessitate a better analysis (C).
+#| fig-height: 2
+#| fig-pos: H
+#| fig-align: center
+#| label: fig-dist2
+
+
+SLEPTIM1_plot <- exp_set %>%
+  ggplot(aes(x = SLEPTIM1)) +
+  geom_histogram(binwidth = 1, fill = "lightgreen", color = "white") +
+  labs(
+    x = "Hours of Sleep per Day",
+    y = "Count"
+  ) 
+
+MENTHLTH_plot <- exp_set %>%
+  ggplot(aes(x = MENTHLTH)) +
+  geom_histogram(binwidth = 1, fill = "lightgreen", color = "white") +
+  labs(
+    x = "Days with Poor Mental Health",
+    y = "Count"
+  ) 
+
+MENTHLTH_CAT_plot <- exp_set %>%
+  ggplot(aes(x = MENTHLTH_CAT)) +
+  geom_bar( fill = "darkgreen", color = "white") +
+  labs(
+    x = "Catagory of Poor Mental Days",
+    y = "Count"
+  ) 
+
+
+(SLEPTIM1_plot + MENTHLTH_plot + MENTHLTH_CAT_plot) +
+  plot_annotation(
+    title = "Distributions of Key Variables",
+    tag_levels = "A",
+    theme = annotation_theme
+  )
+
+```
+
+**Appendix B:** *Plot for Linear Conditional Expectation Assumption*
+
+```{r linear conditional expectation plot, echo=FALSE, message=FALSE}
+#| fig-cap: Appendix B- We plot the residual vs. fitted values of our model to see if the Linear Conditional Expectation (LCE) assumption holds. On the initial  plot (A) we see a very flat line, and some serious striation. The striation is expected due to the binned numerical inputs of sleep (whole hours of sleep). Zooming in (B), we see some bending of the regression line. Due to the size of the dataset we used a generalized additive model curve (GAM) instead of a LOESS smoother.  While the bend is not extreme it suggests that our model might not contain only nonlinear relationships. This indicates a mild violation of the LCE assumption; however it might not be significant given the complicated nature of sleep.
+#| fig-height: 3
+#| fig-pos: H
+#| fig-align: center
+#| label: collinearity_plot
+
+
+plot<- ggplot(model_data, aes(x = fitted, y = residuals)) +
+  geom_bin2d(bins = 20) + 
+  #stat_summary_hex(aes(z = residuals), bins = 20, fun = length) + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(method = "gam", se = TRUE, color = "black") +
+   scale_fill_distiller(palette = "YlOrRd", direction = 1, na.value = "grey90", name = "Count") +
+  labs(x = "Fitted Values", y = "Residuals", fill = "Count")  + 
+  guides(fill = "none") 
+  
+
+
+#print(plot)
+zoom_plot <- ggplot(model_data, aes(x = fitted, y = residuals)) +
+  geom_bin2d(bins = 20) + 
+  #stat_summary_hex(aes(z = residuals), bins = 20, fun = length) + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(method = "gam", se = TRUE, color = "black", linewidth = 1) +
+   scale_fill_distiller(palette = "YlOrRd", direction = 1, na.value = "grey90", name = "Count") +
+  labs(x = "Fitted Values", y = "Residuals", fill = "Count")  +
+  coord_cartesian(ylim = c(-1.5, 1.5))
+
+
+(plot + zoom_plot) +
+  plot_annotation(
+    title = "Residuals vs Fitted Values",
+    tag_levels = "A",
+    theme = annotation_theme
+  )
+```
+
+**Appendix C:** *Q-Q Plot*
+
+```{r qq_normal, echo = FALSE}
+#| fig-cap: Appendix C- As shown in the Q-Q plot, the central portion of the residual distribution follows the 45-degree reference line fairly closely. However, the tails deviate from normality, particularly at both extremes, where residuals are more spread out than expected under a normal distribution. This "heavy-tailed" pattern is not uncommon in real-world data.
+#| fig-height: 2
+#| fig-align: center
+#| fig-pos: H
+#| label: qq-plot
+# Q-Q plot of residuals
+
+qq_plot <- ggplot(model_data, aes(sample = residuals)) +
+  stat_qq(alpha = 0.3, size = 0.8) %>% rasterise() +
+  stat_qq_line(color = "steelblue", linetype = "dashed") +
+  labs(x = "Theoretical Quantiles",
+       y = "Sample Quantiles") +
+  annotation_theme
+
+
+(qq_plot) +
+  plot_annotation(
+    title = "Q-Q Plot of Model Residuals",
+    theme = annotation_theme
+  )
+
+
+```
+
+**Appendix D:** *Vif() factor summary*
+
+```{r vif, echo=FALSE}
+summarize_vif_table(model2)
+```
+
+**Appendix E:** *Breusch-Pagan Test Results*
+
+```{r homoskedastic, echo=FALSE}
+lmtest::bptest(model2)
+```
+
+## Github Repository
+
+[Github Project Repository](https://github.com/jandersen12/lab_2)
+
+# References {.heading-2}
